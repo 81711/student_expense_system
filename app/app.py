@@ -6,6 +6,11 @@ import calendar
 from datetime import datetime, timedelta
 from typing import Tuple, List
 
+# -------------------------- 【修复1：路径适配，本地+云端都能正常找到文件】 --------------------------
+# 获取当前app.py文件所在的目录，彻底解决相对路径混乱问题
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
 # 页面全局配置
 st.set_page_config(
     page_title="学生消费行为分析与记账系统",
@@ -13,30 +18,33 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# -------------------------- 全局常量 --------------------------
-DATA_FILE = "../data/expenses.csv"
-CATEGORY_FILE = "../data/categories.csv"
-BUDGET_FILE = "../data/budget.csv"
+# -------------------------- 全局常量（路径已修复） --------------------------
+DATA_FILE = os.path.join(DATA_DIR, "expenses.csv")
+CATEGORY_FILE = os.path.join(DATA_DIR, "categories.csv")
+BUDGET_FILE = os.path.join(DATA_DIR, "budget.csv")
+
 # 餐饮营养标签库
 FOOD_TAG_LIST = ["早餐", "正餐", "食堂", "家常菜", "外卖", "快餐", "奶茶", "饮料", "零食", "烧烤", "火锅", "其他餐饮"]
 
 
 # -------------------------- 工具函数：数据读写 --------------------------
 def init_data_files():
-    """初始化所有数据文件"""
-    if not os.path.exists("../data"):
-        os.makedirs("../data")
-
+    """初始化所有数据文件和文件夹"""
+    # 先创建data文件夹，不存在就新建
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+    # 初始化分类文件
     if not os.path.exists(CATEGORY_FILE):
         default_categories = ["餐饮", "学习", "娱乐", "交通", "日用品", "其他"]
         pd.DataFrame({"分类名称": default_categories}).to_csv(CATEGORY_FILE, index=False, encoding="utf-8-sig")
-
+    # 初始化预算文件
     if not os.path.exists(BUDGET_FILE):
         pd.DataFrame(columns=["年份", "月份", "预算金额"]).to_csv(BUDGET_FILE, index=False, encoding="utf-8-sig")
 
 
-@st.cache_data(ttl=0)
+@st.cache_data(ttl=60)  # 缓存60秒，避免频繁读文件，同时保证数据更新
 def load_categories() -> List[str]:
+    """加载消费分类列表"""
     if os.path.exists(CATEGORY_FILE):
         df = pd.read_csv(CATEGORY_FILE, encoding="utf-8-sig")
         return df["分类名称"].tolist()
@@ -44,11 +52,13 @@ def load_categories() -> List[str]:
 
 
 def save_categories(categories: List[str]) -> None:
+    """保存消费分类列表"""
     pd.DataFrame({"分类名称": categories}).to_csv(CATEGORY_FILE, index=False, encoding="utf-8-sig")
 
 
-@st.cache_data(ttl=0)
+@st.cache_data(ttl=60)
 def load_budget(year: int, month: int) -> float:
+    """加载指定年月的预算"""
     if os.path.exists(BUDGET_FILE):
         df = pd.read_csv(BUDGET_FILE, encoding="utf-8-sig")
         match = df[(df["年份"] == year) & (df["月份"] == month)]
@@ -58,39 +68,70 @@ def load_budget(year: int, month: int) -> float:
 
 
 def save_budget(year: int, month: int, amount: float) -> None:
+    """保存指定年月的预算"""
     if os.path.exists(BUDGET_FILE):
         df = pd.read_csv(BUDGET_FILE, encoding="utf-8-sig")
     else:
         df = pd.DataFrame(columns=["年份", "月份", "预算金额"])
-
     mask = (df["年份"] == year) & (df["月份"] == month)
     if len(df[mask]) > 0:
         df.loc[mask, "预算金额"] = round(amount, 2)
     else:
         new_row = pd.DataFrame([{"年份": year, "月份": month, "预算金额": round(amount, 2)}])
         df = pd.concat([df, new_row], ignore_index=True)
-
     df.to_csv(BUDGET_FILE, index=False, encoding="utf-8-sig")
 
 
-@st.cache_data(ttl=0)
+@st.cache_data(ttl=10)  # 数据频繁更新，缓存10秒
 def load_data() -> pd.DataFrame:
+    """【修复2：统一日期处理，列名统一为“日期”，兜底缺失列】加载消费数据，统一处理格式"""
+    # 定义必填的列和对应的数据类型
+    REQUIRED_COLUMNS = {
+        "日期": "object",
+        "金额": "float64",
+        "分类": "object",
+        "是否餐饮": "bool",
+        "备注": "object"
+    }
+
     if os.path.exists(DATA_FILE):
+        # 读取csv文件
         df = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
-        df["日期"] = pd.to_datetime(df["日期"]).dt.date
+
+        # ========== 核心修复：检查缺失列，自动补全 ==========
+        for col_name, col_type in REQUIRED_COLUMNS.items():
+            if col_name not in df.columns:
+                # 列不存在，创建空列并设置对应类型
+                if col_type == "bool":
+                    df[col_name] = False
+                elif col_type == "float64":
+                    df[col_name] = 0.01
+                else:
+                    df[col_name] = ""
+
+        # 强制转换日期格式，兜底错误数据
+        df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.date
+        # 金额格式处理，兜底无效值
         df["金额"] = pd.to_numeric(df["金额"], errors="coerce").fillna(0.01).round(2)
-        df["是否餐饮"] = df["是否餐饮"].astype(bool)
+        # 布尔值处理
+        df["是否餐饮"] = df["是否餐饮"].fillna(False).astype(bool)
+        # 备注处理
         df["备注"] = df["备注"].fillna("").astype(str)
+        # 生成记录序号
         df.insert(0, "记录序号", range(1, len(df) + 1))
+        # 过滤掉日期无效的数据
+        df = df.dropna(subset=["日期"])
         return df
     else:
+        # 空数据时，直接生成带所有必填列的空DataFrame
         return pd.DataFrame(
-            columns=["记录序号", "日期", "金额", "分类", "是否餐饮", "备注"],
+            columns=["记录序号"] + list(REQUIRED_COLUMNS.keys()),
             dtype=object
         )
 
 
 def save_data(df: pd.DataFrame) -> None:
+    """保存消费数据"""
     save_df = df.drop(columns=["记录序号"])
     save_df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
 
@@ -100,10 +141,8 @@ def detect_expense_anomalies(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     """消费异常检测，基于分类IQR和日均消费双重判定"""
     if len(df) < 5:
         return pd.DataFrame(), {"异常总笔数": 0, "异常总金额": 0, "单笔异常数": 0, "单日异常数": 0}
-
     anomaly_records = []
     anomaly_stats = {"单笔异常数": 0, "单日异常数": 0}
-
     # 1. 单笔消费异常检测（分类IQR法）
     category_group = df.groupby("分类")
     for category, group in category_group:
@@ -119,7 +158,6 @@ def detect_expense_anomalies(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             category_anomaly["异常原因"] = f"超出[{category}]分类正常消费区间（上限{round(upper_bound, 2)}元）"
             anomaly_records.append(category_anomaly)
             anomaly_stats["单笔异常数"] += len(category_anomaly)
-
     # 2. 单日消费异常检测（历史日均2倍判定）
     day_group = df.groupby("日期")["金额"].sum().reset_index()
     day_group.columns = ["日期", "当日总消费"]
@@ -135,7 +173,6 @@ def detect_expense_anomalies(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
                     "异常原因"] = f"当日总消费{round(row['当日总消费'], 2)}元，超出历史日均消费2倍（基准{round(history_avg, 2)}元）"
                 anomaly_records.append(day_detail)
             anomaly_stats["单日异常数"] += len(day_anomaly)
-
     # 合并去重
     if len(anomaly_records) > 0:
         anomaly_df = pd.concat(anomaly_records, ignore_index=True)
@@ -146,24 +183,21 @@ def detect_expense_anomalies(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         anomaly_df = pd.DataFrame()
         anomaly_stats["异常总笔数"] = 0
         anomaly_stats["异常总金额"] = 0.00
-
     return anomaly_df, anomaly_stats
 
 
 def analyze_consumption_pattern(df: pd.DataFrame, current_year: int, current_month: int, month_budget: float) -> Tuple[
     dict, dict, str]:
+    """消费模式识别与预算预警"""
     pattern_result = {}
     forecast_result = {}
     warning_msg = ""
-
     if len(df) < 10:
         return pattern_result, forecast_result, "数据量不足，无法完成模式识别与预测，请补充更多消费记录"
-
     # 消费模式识别
     category_sum = df.groupby("分类")["金额"].sum().sort_values(ascending=False)
     pattern_result["核心消费分类"] = category_sum.head(3).index.tolist()
     pattern_result["分类占比"] = (category_sum / category_sum.sum() * 100).round(2).to_dict()
-
     # 工作日/周末消费差异
     df_copy = df.copy()
     df_copy["星期"] = pd.to_datetime(df_copy["日期"]).dt.weekday
@@ -173,7 +207,6 @@ def analyze_consumption_pattern(df: pd.DataFrame, current_year: int, current_mon
     pattern_result["工作日日均消费"] = round(weekday_avg, 2)
     pattern_result["周末日均消费"] = round(weekend_avg, 2)
     pattern_result["消费高峰"] = "周末" if weekend_avg > weekday_avg * 1.5 else "工作日"
-
     # 当月消费趋势预测
     current_month_df = df[
         (pd.to_datetime(df["日期"]).dt.year == current_year) &
@@ -191,13 +224,11 @@ def analyze_consumption_pattern(df: pd.DataFrame, current_year: int, current_mon
         forecast_result["当前日均消费"] = round(daily_avg, 2)
         forecast_result["预测当月总消费"] = forecast_total
         forecast_result["预算金额"] = month_budget
-
         # 预算预警
         remaining_days = month_days - passed_days
         remaining_budget = month_budget - used_amount
         if remaining_days > 0:
             forecast_result["剩余日均可用额度"] = round(remaining_budget / remaining_days, 2)
-
         if forecast_total > month_budget:
             over_amount = round(forecast_total - month_budget, 2)
             warning_msg = f"高风险预警：按当前消费速度，预计当月超支{over_amount}元，建议立即控制非必要消费"
@@ -207,7 +238,6 @@ def analyze_consumption_pattern(df: pd.DataFrame, current_year: int, current_mon
             warning_msg = f"温馨提示：当月预算已使用过半，剩余{remaining_days}天，日均可用额度{round(remaining_budget / remaining_days, 2)}元"
         else:
             warning_msg = "消费状态健康：当前消费节奏合理，预算充足，可继续保持"
-
     return pattern_result, forecast_result, warning_msg
 
 
@@ -227,7 +257,6 @@ def evaluate_food_health(df: pd.DataFrame) -> Tuple[dict, pd.DataFrame, str]:
         "火锅": {"score": 4, "label": "中等健康", "desc": "火锅饮食易导致油脂和嘌呤摄入超标，建议适量食用"},
         "其他餐饮": {"score": 6, "label": "中等健康", "desc": "未识别到具体餐饮类型，默认中等健康评分"}
     }
-
     food_df = df[df["是否餐饮"] == True].copy()
     if len(food_df) == 0:
         return {}, pd.DataFrame(), "暂无餐饮消费数据，无法完成健康度评估"
@@ -243,7 +272,6 @@ def evaluate_food_health(df: pd.DataFrame) -> Tuple[dict, pd.DataFrame, str]:
     food_df[["健康评分", "健康标签", "健康说明"]] = food_df["备注"].apply(
         lambda x: pd.Series(get_health_score(x))
     )
-
     # 健康度统计
     health_stats = {}
     health_stats["餐饮总笔数"] = len(food_df)
@@ -259,7 +287,6 @@ def evaluate_food_health(df: pd.DataFrame) -> Tuple[dict, pd.DataFrame, str]:
     else:
         health_stats["健康等级"] = "较差"
     health_stats["标签占比"] = (food_df["健康标签"].value_counts(normalize=True) * 100).round(2).to_dict()
-
     # 健康建议
     if health_stats["健康等级"] == "优秀":
         advice = "你的餐饮健康度优秀，饮食结构合理，继续保持当前的健康饮食习惯。"
@@ -269,37 +296,41 @@ def evaluate_food_health(df: pd.DataFrame) -> Tuple[dict, pd.DataFrame, str]:
         advice = "你的餐饮健康度一般，不健康食品占比偏高，建议减少奶茶、零食、火锅的食用，增加规律正餐的占比。"
     else:
         advice = "警告：你的餐饮健康度较差，高油高糖高盐食品食用过多，建议立即调整饮食结构，减少烧烤、奶茶、零食的食用，养成规律三餐的习惯。"
-
     # 三餐规律提醒
     food_df["日期"] = pd.to_datetime(food_df["日期"])
     day_food_count = food_df.groupby("日期")["记录序号"].count()
     no_breakfast_days = len(day_food_count[day_food_count < 2])
     if no_breakfast_days > 0:
         advice += f" 另外，你有{no_breakfast_days}天的餐饮消费不足2笔，存在三餐不规律的情况，建议养成规律吃早餐的习惯。"
-
     return health_stats, food_df, advice
 
 
 # -------------------------- 页面全局初始化 --------------------------
+# 初始化数据文件
 init_data_files()
+# 加载全局数据
 CATEGORY_LIST = load_categories()
 df = load_data()
+# 时间全局变量
 now = datetime.now()
 current_year = now.year
 current_month = now.month
 current_day = now.date()
 current_budget = load_budget(current_year, current_month)
 
-# 计算当月已用金额
+# 【修复3：全局统一计算当月消费，避免重复定义，兜底空数据】
 if len(df) > 0:
-    df["日期"] = pd.to_datetime(df["日期"]).dt.date
+    # 筛选当月消费数据，列名统一用“日期”，彻底解决KeyError
     current_month_expenses = df[
         (pd.to_datetime(df["日期"]).dt.year == current_year) &
         (pd.to_datetime(df["日期"]).dt.month == current_month)
         ]
     used_amount = round(current_month_expenses["金额"].sum(), 2)
 else:
+    current_month_expenses = pd.DataFrame()  # 空数据时也定义变量，避免未定义报错
     used_amount = 0.00
+
+# 预算剩余计算
 remaining_amount = round(current_budget - used_amount, 2) if current_budget > 0 else 0.00
 
 # -------------------------- 侧边栏功能菜单 --------------------------
@@ -324,8 +355,9 @@ st.sidebar.caption("学生消费行为分析与记账系统")
 if menu == "首页预算概览":
     st.title("首页预算概览")
     st.divider()
-
     st.subheader(f"{current_year}年{current_month}月 预算总览")
+
+    # 预算总览卡片
     budget_col1, budget_col2, budget_col3 = st.columns(3)
     with budget_col1:
         st.metric("当月总预算", f"{current_budget} 元")
@@ -335,6 +367,7 @@ if menu == "首页预算概览":
         delta_color = "normal" if remaining_amount >= 0 else "inverse"
         st.metric("当月剩余", f"{remaining_amount} 元", delta_color=delta_color)
 
+    # 预算进度条
     if current_budget > 0:
         progress_percent = min(used_amount / current_budget, 1.0)
         st.progress(progress_percent, text=f"预算使用进度：{round(progress_percent * 100, 1)}%")
@@ -346,8 +379,9 @@ if menu == "首页预算概览":
             st.success("当前预算使用状态健康")
 
     st.divider()
-
     st.subheader("当月消费统计")
+
+    # 【修复4：兜底空数据，避免无数据时的IndexError】
     if len(current_month_expenses) > 0:
         stat_col1, stat_col2, stat_col3 = st.columns(3)
         with stat_col1:
@@ -356,7 +390,9 @@ if menu == "首页预算概览":
             day_avg = round(current_month_expenses["金额"].mean(), 2)
             st.metric("单笔平均消费", f"{day_avg} 元")
         with stat_col3:
-            top_category = current_month_expenses["分类"].value_counts().index[0]
+            # 兜底高频分类，无数据时显示“暂无”
+            category_count = current_month_expenses["分类"].value_counts()
+            top_category = category_count.index[0] if len(category_count) > 0 else "暂无"
             st.metric("最高频消费分类", top_category)
 
         st.divider()
@@ -370,8 +406,8 @@ if menu == "首页预算概览":
 elif menu == "日历记账看板":
     st.title("日历记账看板")
     st.divider()
-
     calendar_col1, calendar_col2 = st.columns([1, 1])
+
     with calendar_col1:
         selected_date = st.date_input(
             "选择日期",
@@ -380,10 +416,13 @@ elif menu == "日历记账看板":
         )
         st.divider()
 
+        # 当日消费统计
         day_expenses = df[df["日期"] == selected_date]
         day_total = round(day_expenses["金额"].sum(), 2)
         select_year = selected_date.year
         select_month = selected_date.month
+
+        # 当月截至当日统计
         month_to_day_expenses = df[
             (pd.to_datetime(df["日期"]).dt.year == select_year) &
             (pd.to_datetime(df["日期"]).dt.month == select_month) &
@@ -447,7 +486,6 @@ elif menu == "日历记账看板":
                 else:
                     final_quick_remark = st.text_input("备注（选填）", placeholder="比如：买教材、公交费",
                                                        key="quick_remark_normal")
-
             quick_submit = st.form_submit_button("保存消费记录", use_container_width=True)
 
         if quick_submit:
@@ -458,12 +496,10 @@ elif menu == "日历记账看板":
                 "是否餐饮": quick_is_food,
                 "备注": final_quick_remark
             }])
-
             if os.path.exists(DATA_FILE):
                 new_data.to_csv(DATA_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
             else:
                 new_data.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
-
             st.success("消费记录保存成功！")
             st.rerun()
 
@@ -471,12 +507,10 @@ elif menu == "日历记账看板":
 elif menu == "消费记录管理":
     st.title("消费记录管理")
     st.divider()
-
     if len(df) == 0:
         st.info("暂无消费记录，无需进行管理操作")
     else:
         tab1, tab2, tab3 = st.tabs(["编辑已有记录", "单条删除记录", "批量删除记录"])
-
         with tab1:
             edit_id = st.selectbox(
                 "选择要编辑的记录序号",
@@ -516,7 +550,6 @@ elif menu == "消费记录管理":
                     else:
                         final_edit_remark = st.text_input("备注（选填）", value=edit_row["备注"],
                                                           key="edit_remark_normal")
-
                 edit_submitted = st.form_submit_button("确认修改记录", use_container_width=True)
 
             if edit_submitted:
@@ -540,7 +573,6 @@ elif menu == "消费记录管理":
             st.write("选中的记录详情：")
             st.dataframe(df[df["记录序号"] == delete_id], use_container_width=True, hide_index=True)
             delete_btn = st.button("确认删除该记录", use_container_width=True, type="primary")
-
             if delete_btn:
                 new_df = df[df["记录序号"] != delete_id]
                 save_data(new_df)
@@ -559,7 +591,6 @@ elif menu == "消费记录管理":
                 st.write("已选中的记录列表：")
                 st.dataframe(df[df["记录序号"].isin(delete_ids)], use_container_width=True, hide_index=True)
                 batch_delete_btn = st.button("确认批量删除选中记录", use_container_width=True, type="primary")
-
                 if batch_delete_btn:
                     new_df = df[~df["记录序号"].isin(delete_ids)]
                     save_data(new_df)
@@ -572,7 +603,6 @@ elif menu == "消费记录管理":
 elif menu == "记录筛选查询":
     st.title("消费记录筛选查询")
     st.divider()
-
     if len(df) == 0:
         st.info("暂无消费记录")
     else:
@@ -603,7 +633,6 @@ elif menu == "记录筛选查询":
         total_money = round(filter_df["金额"].sum(), 2)
         avg_money = round(filter_df["金额"].mean(), 2) if len(filter_df) > 0 else 0.00
         record_count = len(filter_df)
-
         stat_col1, stat_col2, stat_col3 = st.columns(3)
         with stat_col1:
             st.metric("筛选范围内总消费", f"{total_money} 元")
@@ -616,23 +645,21 @@ elif menu == "记录筛选查询":
         st.subheader("筛选结果详情")
         st.dataframe(filter_df, use_container_width=True, hide_index=True)
 
-# 5. 数据可视化分析（新增每日/每月/每年维度切换）
+# 5. 数据可视化分析
 elif menu == "数据可视化分析":
     st.title("消费数据可视化分析")
     st.divider()
-
     if len(df) == 0:
         st.info("暂无消费数据，无法生成分析图表")
     else:
-        # 新增：时间维度切换器
+        # 时间维度切换器
         st.subheader("时间维度选择")
         time_dimension = st.radio("选择统计周期", ["每日", "每月", "每年"], horizontal=True)
         st.divider()
 
-        # 数据预处理：根据选择的维度生成时间字段
+        # 数据预处理
         df_viz = df.copy()
         df_viz["日期"] = pd.to_datetime(df_viz["日期"])
-
         if time_dimension == "每日":
             df_viz["时间维度"] = df_viz["日期"].dt.date
             x_title = "日期"
@@ -649,9 +676,8 @@ elif menu == "数据可视化分析":
             chart_title = "每年消费金额趋势（分分类堆叠）"
             line_title = "每年总消费金额变化趋势"
 
-        # 按维度+分类聚合数据
+        # 数据聚合
         dimension_category_sum = df_viz.groupby(["时间维度", "分类"], as_index=False)["金额"].sum()
-        # 按维度聚合总消费
         dimension_total_sum = df_viz.groupby("时间维度", as_index=False)["金额"].sum()
 
         # 图表1：消费分类总占比饼图
@@ -669,8 +695,7 @@ elif menu == "数据可视化分析":
         st.plotly_chart(pie_fig, use_container_width=True)
 
         st.divider()
-
-        # 图表2：分分类堆叠柱状图（适配所选时间维度）
+        # 图表2：分分类堆叠柱状图
         st.subheader(chart_title)
         bar_fig = px.bar(
             dimension_category_sum,
@@ -689,8 +714,7 @@ elif menu == "数据可视化分析":
         st.plotly_chart(bar_fig, use_container_width=True)
 
         st.divider()
-
-        # 图表3：总消费趋势折线图（适配所选时间维度）
+        # 图表3：总消费趋势折线图
         st.subheader(line_title)
         line_fig = px.line(
             dimension_total_sum,
@@ -710,7 +734,6 @@ elif menu == "数据可视化分析":
 elif menu == "智能消费分析":
     st.title("智能消费分析")
     st.divider()
-
     if len(df) < 10:
         st.info("消费记录数据量不足，需至少10条记录才能启动智能分析，请补充更多消费数据")
     else:
@@ -719,7 +742,6 @@ elif menu == "智能消费分析":
             "消费模式识别与预算预警",
             "餐饮健康度评估"
         ])
-
         # 消费异常智能检测
         with ai_tab1:
             st.subheader("消费异常智能检测结果")
@@ -727,7 +749,6 @@ elif menu == "智能消费分析":
             st.divider()
 
             anomaly_df, anomaly_stats = detect_expense_anomalies(df)
-
             anomaly_col1, anomaly_col2, anomaly_col3, anomaly_col4 = st.columns(4)
             with anomaly_col1:
                 st.metric("异常消费总笔数", anomaly_stats["异常总笔数"])
@@ -752,6 +773,7 @@ elif menu == "智能消费分析":
             pattern_result, forecast_result, warning_msg = analyze_consumption_pattern(df, current_year, current_month,
                                                                                        current_budget)
 
+            # 预警提示
             if "高风险预警" in warning_msg:
                 st.error(warning_msg)
             elif "中度预警" in warning_msg:
@@ -845,7 +867,6 @@ elif menu == "智能消费分析":
 elif menu == "系统设置":
     st.title("系统设置")
     st.divider()
-
     setting_tab1, setting_tab2 = st.tabs(["自定义消费分类", "每月预算设置"])
 
     with setting_tab1:
@@ -893,7 +914,6 @@ elif menu == "系统设置":
         with col_month:
             set_month = st.number_input("选择月份", min_value=1, max_value=12, value=current_month, step=1,
                                         key="set_month")
-
         existing_budget = load_budget(int(set_year), int(set_month))
         set_amount = st.number_input(
             f"设置{int(set_year)}年{int(set_month)}月的预算金额（元）",
@@ -903,7 +923,6 @@ elif menu == "系统设置":
             value=existing_budget if existing_budget > 0 else 1000.00,
             key="set_amount"
         )
-
         save_budget_btn = st.button("保存预算设置", use_container_width=True, key="save_budget")
         if save_budget_btn:
             save_budget(int(set_year), int(set_month), set_amount)
